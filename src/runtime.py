@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from typing import Any
 
 from agenthack import AgentRuntime
@@ -13,12 +14,18 @@ from fastapi import Body, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
+from src.config import RuntimeConfig
+from src.time_limits import case_seconds, within_case
 from src.dispatch.loader import CASE_ID_PATTERN, FUNCTIONS
+from src.handlers.base import HandlerError
 from src.llm.parsing import LLMError
 from src.reproduction.errors import PlatformExecutionUnknownError, PlatformUnavailableError
-from src.submission.schemas import FUNCTION_BY_CASE_PREFIX, OUTPUT_FIELDS
+from src.submission.schemas import (
+    FUNCTION_BY_CASE_PREFIX, OUTPUT_FIELDS, OutputSchemaError, validate_report_payload,
+)
+from src.submission.writer import ResultWriter, SubmissionError
 
-DEFAULT_TIMEOUT_MS = 180_000
+DEFAULT_TIMEOUT_MS = 900_000
 TELEMETRY_FLUSH_TIMEOUT_S = 1.0
 logger = logging.getLogger(__name__)
 
@@ -74,6 +81,9 @@ class FlexibleAgentRuntime(AgentRuntime):
             except TaskInputError as exc:
                 return JSONResponse(status_code=422, content={"detail": exc.issues})
             case_id = task_input.get("case_id")
+            request_deadline = time.monotonic() + timeout_ms / 1000
+            response_reserve = min(TELEMETRY_FLUSH_TIMEOUT_S, timeout_ms / 100_000)
+            solve_timeout = max(0.001, timeout_ms / 1000 - response_reserve)
 
             output: dict[str, Any] = {"case_id": case_id}
             try:
@@ -86,19 +96,24 @@ class FlexibleAgentRuntime(AgentRuntime):
                 ):
                     with task() as task_operation:
                         result = await asyncio.wait_for(
-                            self.agent.solve(task_input), timeout_ms / 1000
+                            within_case(self.agent.solve(task_input),
+                                        task_input.get("function") or task_input.get("case_id") or task_id,
+                                        timeout_s=solve_timeout), solve_timeout
                         )
                         if not isinstance(result, dict):
                             raise RuntimeError("agent output must be a JSON object")
                         function = task_input.get("function")
-                        if function in OUTPUT_FIELDS and (
+                        if function in ("Survey", "Idea"):
+                            validate_report_payload(result, task_input["case_id"])
+                        elif function in OUTPUT_FIELDS and (
                             set(result) != set(OUTPUT_FIELDS[function])
                             or result.get("case_id") != task_input["case_id"]
                         ):
                             raise RuntimeError("agent output does not match the assigned schema")
                         output = result
                         task_operation.result(output)
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as exc:
+                self._record_failure(case_id, task_input.get("function"), 504, exc)
                 return JSONResponse(status_code=504, content={"detail": "task timed out"})
             except asyncio.CancelledError:
                 raise
@@ -113,6 +128,20 @@ class FlexibleAgentRuntime(AgentRuntime):
                 )
                 logger.error("/solve failed case_id=%s function=%s status=%s error_type=%s",
                              case_id, task_input.get("function"), status, type(exc).__name__)
+                self._record_failure(case_id, task_input.get("function"), status, exc)
+                if isinstance(exc, LLMError):
+                    logger.error("gateway failure case_id=%s upstream_status=%s retryable=%s",
+                                 case_id, exc.status_code, exc.retryable)
+                if isinstance(exc, HandlerError):
+                    # Handler messages contain validation summaries and own-team
+                    # diagnostic paths, never gateway headers or configuration.
+                    summary = str(exc).encode("utf-8", "backslashreplace").decode("utf-8")
+                    logger.error("handler validation case_id=%s: %s", case_id, summary[:4000])
+                if isinstance(exc, OutputSchemaError):
+                    logger.error("output schema issues case_id=%s: %s", case_id, "; ".join(exc.issues))
+                    return JSONResponse(status_code=status, content={"detail": {
+                        "type": "OutputSchemaError", "issues": exc.issues,
+                    }})
                 if isinstance(exc, PermissionError):
                     logger.error(
                         "Check non-root write access to /output/data/<RESEARCH_WORKSPACE_TEAM>; "
@@ -124,7 +153,7 @@ class FlexibleAgentRuntime(AgentRuntime):
                     try:
                         await asyncio.wait_for(
                             asyncio.to_thread(self.telemetry.flush),
-                            TELEMETRY_FLUSH_TIMEOUT_S,
+                            max(0.001, min(TELEMETRY_FLUSH_TIMEOUT_S, request_deadline - time.monotonic())),
                         )
                     except asyncio.TimeoutError:
                         logger.warning("Telemetry flush timed out after solve")
@@ -137,6 +166,25 @@ class FlexibleAgentRuntime(AgentRuntime):
             # The challenge platform reads the case result itself, not the
             # SDK's task envelope, and compares it with the result file.
             return output
+
+    def _record_failure(self, case_id: Any, function: Any, status: int, exc: Exception) -> None:
+        """Own-team diagnostic only; never a replacement or a fabricated answer."""
+        config = getattr(self.agent, "config", None)
+        if not isinstance(config, RuntimeConfig) or not isinstance(case_id, str):
+            return
+        if not CASE_ID_PATTERN.fullmatch(case_id):
+            return
+        relative = f"data/{config.team}/work/cases/{case_id}/solve-failure.json"
+        try:
+            ResultWriter(config).write_json(relative, {
+                "case_id": case_id, "function": function, "diagnostic_only": True,
+                "http_status": status, "error_type": type(exc).__name__,
+                "upstream_status": exc.status_code if isinstance(exc, LLMError) else None,
+                "retryable": exc.retryable if isinstance(exc, LLMError) else None,
+            }, ensure_ascii=True)
+        except (OSError, ValueError, SubmissionError) as diagnostic_error:
+            logger.warning("solve failure diagnostic unavailable for %s (%s)",
+                           case_id, type(diagnostic_error).__name__)
 
     @staticmethod
     def _normalize(payload: Any):
@@ -217,11 +265,14 @@ def _optional_metadata(payload: dict[str, Any], field: str) -> str | None:
 
 
 def _timeout_ms(payload: dict[str, Any]) -> int:
+    inner = payload.get("input") if isinstance(payload.get("input"), dict) else {}
+    category = (payload.get("function") or inner.get("function") or payload.get("case_id")
+                or inner.get("case_id") or payload.get("task_id") or payload.get("task_type"))
+    maximum = int(case_seconds(category) * 1000)
     constraints = payload.get("constraints")
-    if isinstance(constraints, dict):
-        if "timeout_ms" in constraints:
-            value = constraints["timeout_ms"]
-            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
-                return value
-            raise TaskInputError([_issue("constraints", "timeout_ms must be a positive integer")])
-    return DEFAULT_TIMEOUT_MS
+    if isinstance(constraints, dict) and "timeout_ms" in constraints:
+        value = constraints["timeout_ms"]
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return min(value, maximum)
+        raise TaskInputError([_issue("constraints", "timeout_ms must be a positive integer")])
+    return maximum

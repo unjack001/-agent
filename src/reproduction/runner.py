@@ -1,4 +1,4 @@
-"""Coordinate the D-class pipeline: materials -> source -> self-check -> platform."""
+"""Coordinate D: current model source -> current platform experiment client."""
 
 from __future__ import annotations
 
@@ -6,12 +6,15 @@ import asyncio
 import logging
 import time
 from pathlib import Path
+from dataclasses import replace
 from typing import Any
 
+from src.time_limits import deadline_end, D_CLIENT_MAX_S, SAVE_RESERVE_S
 from src.config import RuntimeConfig
 from src.dispatch.models import CaseQuestion
 from src.handlers.base import HandlerContext
 from src.materials.models import MaterialError
+from src.materials.case_materials import CaseMaterials
 from src.reproduction.errors import (
     ReproductionError,
     SelfCheckError,
@@ -27,20 +30,53 @@ from src.reproduction.platform_client import run_case
 from src.reproduction.source_checks import check_source_file
 from src.reproduction.source_generation import SourceAttempt, SourceGenerator
 from src.submission.paths import result_json
-from src.submission.writer import ResultWriter
+from src.submission.writer import ResultWriter, SubmissionError
 
 logger = logging.getLogger(__name__)
+
+# Stage maxima are not guaranteed allocations. Allow long model generation;
+# the formal client receives the remaining case budget, capped at 880 seconds.
+FORMAL_RESERVE_S = 60.0 + SAVE_RESERVE_S
+GENERATION_CAPS_S = (900.0, 900.0)
+MIN_GENERATION_S = 10.0
 
 
 class Deadline:
     def __init__(self, seconds: float) -> None:
-        self.end = time.monotonic() + seconds
+        self.end = deadline_end(seconds)
 
     def remaining(self) -> float:
         return self.end - time.monotonic()
 
-    def timeout(self, cap: float) -> float:
-        return max(1.0, min(cap, self.remaining()))
+    def timeout(self, cap: float, *, reserve: float = 0.0) -> float:
+        return max(0.0, min(cap, self.remaining() - reserve))
+
+
+class PipelineDiagnostics:
+    """Own-team diagnostics; these records are not platform execution evidence."""
+
+    def __init__(self, config: RuntimeConfig, case_id: str, deadline: Deadline) -> None:
+        self.config = config
+        self.case_id = case_id
+        self.deadline = deadline
+        self.events: list[dict[str, Any]] = []
+
+    def record(self, stage: str, **details: Any) -> None:
+        event = {"stage": stage, "remaining_s": round(max(0.0, self.deadline.remaining()), 3)}
+        event.update(details)
+        self.events.append(event)
+        logger.info("D %s stage=%s remaining_s=%s", self.case_id, stage, event["remaining_s"])
+        relative = f"data/{self.config.team}/work/dcase/{self.case_id}/pipeline-state.json"
+        try:
+            ResultWriter(self.config).write_json(relative, {
+                "case_id": self.case_id,
+                "diagnostic_only": True,
+                "trusted_execution_evidence": False,
+                "events": self.events,
+            })
+        except (OSError, ValueError, SubmissionError) as exc:
+            logger.warning("D %s pipeline diagnostics unavailable (%s)",
+                           self.case_id, type(exc).__name__)
 
 
 def _metrics(protocol: dict[str, Any]) -> list[dict[str, Any]]:
@@ -144,11 +180,29 @@ async def run_reproduction(
 ) -> dict[str, Any]:
     config = context.config
     case_id = question.case_id
+    # Include material loading in the same whole-question budget. The final
+    # client needs time for source admission, formal execution and artifact copy.
+    deadline = Deadline(1800.0)
+    diagnostics = PipelineDiagnostics(config, case_id, deadline)
+    diagnostics.record("started")
     materials = ExperimentMaterials(config)
     input_specs = _input_metric_specs(question)
 
     try:
-        bundle = materials.bundle(case_id)
+        bundle = materials.bundle(case_id, question=question)
+        try:
+            pdfs = [name for name in question.materials if name.lower().endswith(".pdf")]
+            if pdfs:
+                scoped = replace(question, materials=pdfs)
+                refs = await asyncio.to_thread(CaseMaterials(context, scoped).resolve)
+                digests = await asyncio.to_thread(context.library.digests,
+                    question.title + "\n" + question.input, refs, max_pages_per_paper=8)
+                notes = "\n\n".join(
+                    f"{d.filename}\n" + "\n".join(f"[PDF p.{e.page}] {e.text}" for e in d.excerpts)
+                    for d in digests)
+                bundle = replace(bundle, paper_notes=notes)
+        except (ValueError, PermissionError, OSError) as exc:
+            raise MaterialError("current question PDF material could not be read") from exc
     except MaterialError as exc:
         protocol = _read_protocol_quietly(materials, case_id)
         failure_protocol = _failure_protocol(protocol, input_specs)
@@ -163,6 +217,7 @@ async def run_reproduction(
             # required metrics; preserve the original material error.
             raise exc
         logger.warning("D %s materials missing: %s", case_id, exc)
+        diagnostics.record("materials_missing", reason=str(exc))
         _write_submission(config, case_id, payload)
         return payload
 
@@ -178,103 +233,88 @@ async def run_reproduction(
 
     work_dir = config.result_root / "data" / config.team / "work" / "dcase" / case_id
     work_dir.mkdir(parents=True, exist_ok=True)
-    # The platform hard-stops /solve at 180s; keep a small return margin.
-    deadline = Deadline(170.0)
     generator = SourceGenerator(context.llm, work_dir)
 
     current: SourceAttempt | None = None
+    previous: SourceAttempt | None = None
     last_error = ""
 
-    for attempt_index in range(2):
+    # At most two complete model replies. Both initial generation and repair
+    # consume only the budget above FORMAL_RESERVE_S, never the formal reserve.
+    for attempt_index, cap in enumerate(GENERATION_CAPS_S):
+        generation_timeout = deadline.timeout(cap, reserve=FORMAL_RESERVE_S)
+        if generation_timeout < MIN_GENERATION_S:
+            last_error = "generation budget exhausted; formal experiment time was reserved"
+            diagnostics.record("source_generation_skipped", attempt=attempt_index + 1,
+                               reason=last_error, available_s=round(generation_timeout, 3))
+            break
+        diagnostics.record("source_generation_requested", attempt=attempt_index + 1,
+                           timeout_s=round(generation_timeout, 3), repair=previous is not None)
         try:
-            attempt = await generator.generate(
-                bundle, question, timeout=deadline.timeout(60.0)
-            )
+            if previous is None:
+                attempt = await generator.generate(bundle, question, timeout=generation_timeout)
+            else:
+                attempt = await generator.repair(
+                    bundle, question, previous=previous, error=last_error,
+                    timeout=generation_timeout,
+                )
         except SourceGenerationError as exc:
             last_error = str(exc)
-            if attempt_index == 0 and deadline.remaining() > 90:
-                continue
+            diagnostics.record("source_generation_error", attempt=attempt_index + 1,
+                               reason=last_error, upstream_status=exc.upstream_status,
+                               retryable=exc.retryable)
+            previous = None
+            # Only a received, correctable output can enter repair.
             break
 
         if attempt.source_path is not None:
             current = attempt
+            diagnostics.record("source_saved", attempt=attempt.attempt,
+                               source_sha256=attempt.source_sha256)
             break
 
         last_error = attempt.error or "source extraction failed"
-        if deadline.remaining() > 70:
-            try:
-                repaired = await generator.repair(
-                    bundle,
-                    question,
-                    previous=attempt,
-                    error=last_error,
-                    timeout=deadline.timeout(45.0),
-                )
-            except SourceGenerationError as exc:
-                last_error = str(exc)
-                break
-            if repaired.source_path is not None:
-                current = repaired
-        break
+        diagnostics.record("source_rejected", attempt=attempt.attempt, reason=last_error)
+        previous = attempt
 
     if current is None:
         logger.warning("D %s source generation failed: %s", case_id, last_error)
+        diagnostics.record("source_generation_failed", reason=last_error,
+                           formal_client_attempted=False)
         payload = build_failure_submission(case_id, "failed", failure_protocol)
         _write_submission(config, case_id, payload)
         return payload
 
-    if deadline.remaining() > 55:
+    # The official extractor has already checked the complete response, size,
+    # UTF-8, Python 3.9 syntax and top-level entrypoint. Additional local
+    # heuristics must not turn an extractable source into a local-only run.
+    if deadline.remaining() > FORMAL_RESERVE_S + 1.0:
         try:
-            await asyncio.to_thread(
-                _validate_generated_source,
-                current.source_path,
+            await asyncio.wait_for(
+                asyncio.to_thread(_validate_generated_source, current.source_path),
+                timeout=min(1.0, deadline.remaining() - FORMAL_RESERVE_S),
             )
-        except SelfCheckError as exc:
-            logger.warning("D %s source validation failed: %s", case_id, exc)
-            repaired: SourceAttempt | None = None
-            if deadline.remaining() > 90:
-                try:
-                    repaired = await generator.repair(
-                        bundle,
-                        question,
-                        previous=current,
-                        error=str(exc),
-                        timeout=deadline.timeout(45.0),
-                    )
-                except SourceGenerationError:
-                    repaired = None
-            if repaired is None or repaired.source_path is None:
-                payload = build_failure_submission(case_id, "failed", failure_protocol)
-                _write_submission(config, case_id, payload)
-                return payload
-            current = repaired
-            if deadline.remaining() <= 50:
-                payload = build_failure_submission(case_id, "failed", failure_protocol)
-                _write_submission(config, case_id, payload)
-                return payload
-            try:
-                await asyncio.to_thread(
-                    _validate_generated_source,
-                    current.source_path,
-                )
-            except SelfCheckError as second_exc:
-                logger.warning(
-                    "D %s repaired source still fails validation: %s",
-                    case_id,
-                    second_exc,
-                )
-                payload = build_failure_submission(case_id, "failed", failure_protocol)
-                _write_submission(config, case_id, payload)
-                return payload
+            diagnostics.record("local_static_checked", blocking=False, executed=False)
+        except Exception as exc:
+            logger.warning("D %s advisory source check: %s", case_id, exc)
+            diagnostics.record("local_static_warning", blocking=False, executed=False,
+                               reason=str(exc))
+    else:
+        diagnostics.record("local_static_skipped", reason="formal reserve protected")
 
-    if deadline.remaining() < 15:
+    if deadline.remaining() < 1:
         logger.warning("D %s has no budget left for the formal experiment", case_id)
+        diagnostics.record("formal_client_not_started", reason="whole-question deadline expired")
         payload = build_failure_submission(case_id, "failed", failure_protocol)
         _write_submission(config, case_id, payload)
         return payload
 
     try:
-        return await asyncio.to_thread(
+        # This is a client invocation, not an assertion that trusted execution
+        # started. Only the platform's /source and /run receipts prove that.
+        diagnostics.record("formal_client_started", client_invocation_only=True,
+                           source_sha256=current.source_sha256)
+        payload = await asyncio.to_thread(
             run_case,
             config,
             config.team,
@@ -282,10 +322,13 @@ async def run_reproduction(
             current.source_path,
             bundle.protocol,
             work_dir,
-            timeout=deadline.timeout(150.0),
+            timeout=deadline.timeout(D_CLIENT_MAX_S, reserve=SAVE_RESERVE_S),
         )
+        diagnostics.record("formal_result_received", submission_status=payload.get("status"))
+        return payload
     except MaterialError as exc:
         logger.warning("D %s formal experiment material missing: %s", case_id, exc)
+        diagnostics.record("formal_client_material_error", reason=str(exc))
         if (config.result_root / result_json(config.team, case_id)).exists():
             raise
         payload = build_failure_submission(case_id, "materials_missing", failure_protocol)
@@ -293,6 +336,7 @@ async def run_reproduction(
         return payload
     except Exception as exc:
         logger.warning("D %s formal experiment failed: %s", case_id, exc)
+        diagnostics.record("formal_client_error", error_type=type(exc).__name__, reason=str(exc))
         if isinstance(exc, (PlatformExecutionUnknownError, PlatformUnavailableError)):
             raise
         if (config.result_root / result_json(config.team, case_id)).exists():

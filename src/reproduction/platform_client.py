@@ -12,6 +12,7 @@ import sys
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from src.time_limits import D_CLIENT_MAX_S, remaining_seconds, SAVE_RESERVE_S
 from src.config import RuntimeConfig
 from src.materials.models import MaterialError
 from src.reproduction.errors import (
@@ -72,7 +73,7 @@ def run_case(
             cwd=str(work_dir),
             env=env,
             capture_output=True,
-            timeout=max(1.0, timeout),
+            timeout=max(0.001, min(timeout, D_CLIENT_MAX_S, remaining_seconds(reserve=SAVE_RESERVE_S))),
         )
     except subprocess.TimeoutExpired as exc:
         _save_logs(work_dir, exc.stdout, exc.stderr)
@@ -129,6 +130,9 @@ def validate_submission(
 
     metrics = submission.get("metrics")
     expected = protocol.get("metrics")
+    if expected is None and isinstance(metrics, list):
+        expected = [{"name": m.get("name"), "unit": m.get("unit")} if isinstance(m, dict) else {}
+                    for m in metrics]
     if not isinstance(metrics, list) or len(metrics) != 3:
         raise PlatformError("submission must contain exactly three metrics")
     if not isinstance(expected, list) or len(expected) != 3:

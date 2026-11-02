@@ -7,6 +7,7 @@ from typing import Any
 
 from agenthack import BaseAgent
 
+from src.time_limits import within_case
 from src.config import RuntimeConfig
 from src.dispatch.loader import FUNCTIONS, DispatchLoader
 from src.dispatch.models import CaseQuestion, DispatchRecord
@@ -14,7 +15,7 @@ from src.handlers.base import CaseHandler, HandlerContext, HandlerError
 from src.handlers.registry import build_handlers
 from src.llm.client import GatewayClient
 from src.submission.paths import idea_markdown, result_json, survey_markdown
-from src.submission.schemas import OUTPUT_FIELDS
+from src.submission.schemas import OUTPUT_FIELDS, OutputSchemaError, validate_report_payload
 from src.submission.writer import ResultWriter, SubmissionError
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,10 @@ class ResearchPilotAgent(BaseAgent):
         )
 
     async def solve(self, task_input: dict[str, Any]) -> dict[str, Any]:
+        category = task_input.get("function") or task_input.get("case_id") or task_input.get("task_id")
+        return await within_case(self._solve(task_input), category)
+
+    async def _solve(self, task_input: dict[str, Any]) -> dict[str, Any]:
         case_id: str | None = None
         try:
             if self._is_direct_question(task_input):
@@ -60,31 +65,36 @@ class ResearchPilotAgent(BaseAgent):
                 question = self.dispatch.load_question_by_id(record, case_id)
                 self._check_inline(task_input, question)
 
-            handler = self.handlers.get(question.function)
-            if handler is None:
-                raise HandlerError(f"no handler for {question.function}")
-            payload = await handler.handle(question)
-            if payload.get("case_id") != case_id:
-                raise HandlerError(
-                    f"handler returned case_id {payload.get('case_id')!r}, "
-                    f"expected {case_id!r}"
-                )
+            return await within_case(self._answer_question(question), question.function)
 
-            if question.function == "Reproduction":
-                self._verify_reproduction(question, payload)
-            else:
-                if question.function in ("Survey", "Idea"):
-                    self._write_report(question, payload)
-                self.writer.write_json(
-                    result_json(self.config.team, case_id), payload
-                )
-            return payload
         except Exception:
             logger.exception(
                 "case %s failed",
                 case_id or task_input.get("case_id") or task_input.get("task_id"),
             )
             raise
+
+    async def _answer_question(self, question: CaseQuestion) -> dict[str, Any]:
+        case_id = question.case_id
+        handler = self.handlers.get(question.function)
+        if handler is None:
+            raise HandlerError(f"no handler for {question.function}")
+        payload = await handler.handle(question)
+        if payload.get("case_id") != case_id:
+            raise HandlerError(
+                f"handler returned case_id {payload.get('case_id')!r}, "
+                f"expected {case_id!r}"
+            )
+
+        if question.function == "Reproduction":
+            self._verify_reproduction(question, payload)
+        else:
+            if question.function in ("Survey", "Idea"):
+                self._write_report(question, payload)
+            self.writer.write_json(
+                result_json(self.config.team, case_id), payload
+            )
+        return payload
 
     def _write_report(self, question: CaseQuestion, payload: dict[str, Any]) -> None:
         path = payload.get("path")
@@ -99,6 +109,10 @@ class ResearchPilotAgent(BaseAgent):
             raise HandlerError(
                 f"{question.case_id}: report path {path!r} must be {expected!r}"
             )
+        try:
+            validate_report_payload(payload, question.case_id, expected_path=expected)
+        except OutputSchemaError as exc:
+            raise HandlerError(f"{question.case_id}: invalid report output: {exc}") from exc
         self.writer.write_markdown(path, markdown)
 
     def _verify_reproduction(

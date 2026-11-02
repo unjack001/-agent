@@ -18,7 +18,7 @@ class RuntimeConfig:
     llm_url: str
     llm_api_key: str
     llm_model: str
-    llm_timeout_s: float = 120.0
+    llm_timeout_s: float = 900.0
 
     def __post_init__(self) -> None:
         team = self.team.strip()
@@ -28,9 +28,9 @@ class RuntimeConfig:
             isinstance(self.llm_timeout_s, bool)
             or not isinstance(self.llm_timeout_s, (int, float))
             or not math.isfinite(self.llm_timeout_s)
-            or not 0 < self.llm_timeout_s <= 170
+            or not 0 < self.llm_timeout_s <= 900
         ):
-            raise ValueError("llm_timeout_s must be finite and between 0 and 170 seconds")
+            raise ValueError("llm_timeout_s must be finite and between 0 and 900 seconds")
         object.__setattr__(self, "team", team)
 
     @classmethod
@@ -76,7 +76,7 @@ class RuntimeConfig:
                 or os.getenv("CHALLENGE_LLM_MODEL")
                 or ""
             ),
-            llm_timeout_s=float(os.getenv("AGENT_LLM_TIMEOUT_S") or "120"),
+            llm_timeout_s=float(os.getenv("AGENT_LLM_TIMEOUT_S") or "900"),
         )
 
     @property

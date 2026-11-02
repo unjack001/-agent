@@ -28,8 +28,10 @@ _TOKEN_RE = re.compile(r"[a-z0-9]+")
 _CJK_RE = re.compile(r"[一-鿿]+")
 MAX_SCAN_FILES = 2000
 MAX_SCAN_ENTRIES = 20_000
-MAX_CONTEXT_CHARS = 120_000
-MAX_PAGE_CHARS = 3000
+MAX_CONTEXT_CHARS = 40_000
+MAX_PAGE_CHARS = 1800
+MAX_CATALOG_CHARS = 6000
+_ABSTRACT_RE = re.compile(r"\babstract\b|摘\s*要\s*[:：]?", re.I)
 
 
 def _tokenize(text: str) -> list[str]:
@@ -63,6 +65,43 @@ def _score(tokens: list[str], query_tokens: list[str], idf: dict[str, float]) ->
     counts = Counter(tokens)
     raw = sum(counts[token] * idf.get(token, 1.0) for token in query_tokens)
     return raw / (len(tokens) ** 0.5 + 1.0)
+
+
+def _evidence_window(text: str, query_tokens: list[str], limit: int) -> str:
+    """Select one verbatim contiguous window, retaining its original PDF page.
+
+    Ranking a page and then keeping only its prefix discards the very evidence
+    used to select it. Never join separated passages into a fabricated quote.
+    """
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    terms = set(query_tokens)
+    starts = {0, max(0, len(text) - limit)}
+    starts.update(range(0, len(text), max(1, limit // 2)))
+    starts.update(match.end() for match in re.finditer(r"\n\s*\n|\n(?=\S)", text))
+    best_start, best_score = 0, (0, 0.0)
+    for start in sorted(starts):
+        tokens = _tokenize(text[start:start + limit])
+        matched = terms.intersection(tokens)
+        score = (len(matched), _score(tokens, list(terms), {}))
+        if score > best_score:
+            best_start, best_score = start, score
+    if best_score[0] == 0:
+        abstract = _ABSTRACT_RE.search(text)
+        if abstract:
+            best_start = abstract.start()
+    return text[best_start:best_start + limit].strip()
+
+
+def _catalog_excerpt(text: str, query_tokens: list[str]) -> str:
+    text = normalize_evidence_text(text)
+    abstract = _ABSTRACT_RE.search(text)
+    if abstract:
+        # Abstracts carry topical evidence even when the query and PDF use
+        # different languages, for which lexical window ranking cannot help.
+        return text[abstract.start():abstract.start() + MAX_CATALOG_CHARS].strip()
+    return _evidence_window(text, query_tokens, MAX_CATALOG_CHARS)
 
 
 class PaperLibrary:
@@ -175,48 +214,8 @@ class PaperLibrary:
         papers: list[PaperRef] | None = None,
         max_papers: int = 150,
     ) -> list[PaperCatalogEntry]:
-        refs = list(papers) if papers is not None else self.all_papers()
-        if not refs:
-            return []
-
-        # Extract first pages only for a query-relevant subset of a large library.
-        if max_papers > 0 and len(refs) > max(max_papers * 2, 300):
-            query_tokens = set(_unique(_tokenize(query)))
-            refs.sort(
-                key=lambda ref: (
-                    -len(query_tokens & set(_tokenize(ref.filename))),
-                    ref.filename.lower(),
-                )
-            )
-            refs = refs[: max(max_papers * 2, 300)]
-
-        entries: list[PaperCatalogEntry] = []
-        documents: list[list[str]] = []
-        for ref in refs:
-            try:
-                pages = self.first_page(ref)
-            except MaterialError:
-                pages = []
-            first_page = pages[0] if pages else ""
-            entries.append(
-                PaperCatalogEntry(
-                    filename=ref.filename,
-                    title=self._title(pages, ref.filename),
-                    snippet=first_page[:800].strip(),
-                )
-            )
-            documents.append(_tokenize(ref.filename + " " + first_page))
-
-        query_tokens = _unique(_tokenize(query))
-        idf = _build_idf(documents)
-        scored = [
-            (_score(tokens, query_tokens, idf), entry)
-            for tokens, entry in zip(documents, entries)
-        ]
-        scored.sort(key=lambda item: (-item[0], item[1].filename.lower()))
-        if max_papers > 0:
-            scored = scored[:max_papers]
-        return [entry for _, entry in scored]
+        from src.materials.retrieval_catalog import build_catalog
+        return build_catalog(self, query, papers, max_papers)
 
     @tool(name="paper_library_digests")
     def digests(
@@ -239,10 +238,11 @@ class PaperLibrary:
             ]
             indices = self._select_pages(evidence_pages, query_tokens, max_pages_per_paper)
             excerpts = tuple(
-                PaperExcerpt(page=index + 1, text=evidence_pages[index][:MAX_PAGE_CHARS].strip())
+                PaperExcerpt(page=index + 1, text=window)
                 for index in indices
                 if has_evidence_text(
-                    evidence_pages[index][:MAX_PAGE_CHARS], filename=ref.filename, title=title
+                    window := _evidence_window(evidence_pages[index], query_tokens, MAX_PAGE_CHARS),
+                    filename=ref.filename, title=title,
                 )
             )
             result.append(PaperDigest(ref.filename, title, excerpts))
@@ -273,7 +273,7 @@ class PaperLibrary:
                 pages = []
             result.append(PaperCatalogEntry(
                 filename=ref.filename, title=self._title(pages, ref.filename),
-                snippet=pages[0][:800].strip() if pages else "",
+                snippet=_catalog_excerpt(pages[0], query_tokens) if pages else "",
             ))
         return result
 

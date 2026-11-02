@@ -12,7 +12,9 @@ from typing import Any
 from src.config import RuntimeConfig
 from src.materials.access import ensure_no_links
 from src.submission.paths import idea_markdown, survey_markdown
-from src.submission.schemas import FUNCTION_BY_CASE_PREFIX, OUTPUT_FIELDS
+from src.submission.schemas import (
+    FUNCTION_BY_CASE_PREFIX, OUTPUT_FIELDS, OutputSchemaError, validate_report_payload,
+)
 
 RESULT_FILE_PATTERN = re.compile(r"^[A-E]-\d{2,}\.json$")
 
@@ -33,7 +35,9 @@ class ResultWriter:
         self.root = config.result_root
         self.team = config.team
 
-    def write_json(self, relative_path: str, payload: dict[str, Any]) -> Path:
+    def write_json(
+        self, relative_path: str, payload: dict[str, Any], *, ensure_ascii: bool = False,
+    ) -> Path:
         """Write JSON and verify it by reading it back.
 
         Survey/Idea answers must be written after their data/expert Markdown
@@ -68,6 +72,12 @@ class ResultWriter:
                     raise SubmissionError(
                         f"{relative_path}: path must be {expected_report!r}"
                     )
+                try:
+                    validate_report_payload(
+                        payload, expected_case_id, expected_path=expected_report,
+                    )
+                except OutputSchemaError as exc:
+                    raise SubmissionError(f"{relative_path}: {exc}") from exc
                 markdown = payload.get("markdown")
                 if not isinstance(markdown, str):
                     raise SubmissionError(f"{relative_path}: markdown must be a string")
@@ -82,7 +92,7 @@ class ResultWriter:
                         f"{relative_path}: markdown does not match {expected_report}"
                     )
         try:
-            text = json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
+            text = json.dumps(payload, ensure_ascii=ensure_ascii, indent=2, allow_nan=False) + "\n"
         except (TypeError, ValueError) as exc:
             raise SubmissionError(f"{relative_path}: payload is not valid JSON: {exc}") from exc
         self._atomic_write(target, self._encode_utf8(text, relative_path))

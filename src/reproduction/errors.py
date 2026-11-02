@@ -8,6 +8,12 @@ class ReproductionError(RuntimeError):
 class SourceGenerationError(ReproductionError):
     """The gateway did not return a usable implementation."""
 
+    def __init__(self, message: str, *, upstream_status: int | None = None,
+                 retryable: bool | None = None) -> None:
+        super().__init__(message)
+        self.upstream_status = upstream_status
+        self.retryable = retryable
+
 
 class SelfCheckError(ReproductionError):
     """The public sample self-check failed."""

@@ -28,6 +28,11 @@ _PAGE_LIST_RE = re.compile(
     re.IGNORECASE,
 )
 _INLINE_CODE_RE = re.compile(r"(?<!`)(`+)(?!`)(.*?)\1(?!`)", re.DOTALL)
+_MATH_RE = re.compile(
+    r"(?<!\\)\$\$[\s\S]*?(?<!\\)\$\$|"
+    r"(?<![\\$])\$(?![$\s])[^\n$]*?(?<![\\\s])\$(?![$0-9])|"
+    r"\\\([\s\S]*?\\\)|\\\[[\s\S]*?\\\]"
+)
 _NUMBER_RE = re.compile(r"[0-9]+")
 
 
@@ -63,7 +68,10 @@ def prose_only(body: str) -> str:
             lines.append("\n")
         else:
             lines.append(line)
-    return _INLINE_CODE_RE.sub(" ", "".join(lines))
+    prose = _INLINE_CODE_RE.sub(" ", "".join(lines))
+    # A bracketed mathematical vector/interval is not a literature citation.
+    # Inspection only: the actual report and its character count are unchanged.
+    return _MATH_RE.sub(lambda match: "\n" * match[0].count("\n") + " ", prose)
 
 
 def _small_integer(value: str) -> int | None:
@@ -127,6 +135,12 @@ def cited_numbers(body: str, max_index: int) -> list[int]:
             if 1 <= number <= max_index
         }
     )
+
+
+def citation_marker_count(body: str) -> int:
+    """Count bracket groups, not papers/pages within a compound citation."""
+    return sum(1 for bracket in _BRACKETS_RE.finditer(prose_only(body))
+               if _CANDIDATE_RE.match(bracket[1]))
 
 
 def validate_citations(body: str, digests: list[PaperDigest]) -> tuple[list[int], list[str]]:

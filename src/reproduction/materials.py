@@ -12,7 +12,6 @@ from typing import Any
 from src.config import RuntimeConfig
 from src.materials.models import MaterialError
 
-SUPPORTED_CASES = ("D-01", "D-02", "D-05")
 
 # The formal D question input states the three required metrics as
 # "name=Macro-F1，unit=分数；name=Accuracy，unit=%；...".  Keep parsing
@@ -49,22 +48,13 @@ class ExperimentBundle:
     case_dir: Path
     method: str
     protocol: dict[str, Any]
-    sample: dict[str, Any]
+    sample: Any
+    paper_notes: str = ""
 
     @property
-    def request(self) -> dict[str, Any]:
-        phase = self.sample.get("phase", "run")
-        if not isinstance(phase, str) or not phase:
-            phase = "run"
-        return {
-            "stage": "run",
-            "payload": {
-                "case_id": self.case_id,
-                "phase": phase,
-                "data": self.sample.get("data"),
-                "protocol": self.protocol,
-            },
-        }
+    def request(self) -> Any:
+        """Return only an actually supplied public request; do not invent phases."""
+        return json.loads(json.dumps(self.sample, ensure_ascii=False))
 
 
 class ExperimentMaterials:
@@ -73,7 +63,7 @@ class ExperimentMaterials:
         self.root = config.experiments_dir
 
     def case_dir(self, case_id: str) -> Path:
-        if case_id not in SUPPORTED_CASES:
+        if not isinstance(case_id, str) or not re.fullmatch(r"D-[0-9]{2,}", case_id):
             raise MaterialError(f"unsupported experiment case: {case_id}")
         try:
             root = self.root.resolve()
@@ -86,16 +76,31 @@ class ExperimentMaterials:
             raise MaterialError(f"experiment materials missing: {path}")
         return path
 
-    def bundle(self, case_id: str) -> ExperimentBundle:
-        case_dir = self.case_dir(case_id)
-        self.verify_manifest(case_dir)
-        return ExperimentBundle(
-            case_id=case_id,
-            case_dir=case_dir,
-            method=self.read_method(case_id, case_dir),
-            protocol=self.read_protocol(case_id, case_dir),
-            sample=self.read_sample(case_id, case_dir),
-        )
+    def bundle(self, case_id: str, question=None) -> ExperimentBundle:
+        # Current runtime files are optional. There is no offline-manual fallback.
+        if not isinstance(case_id, str) or not re.fullmatch(r"D-[0-9]{2,}", case_id):
+            raise MaterialError(f"invalid experiment case: {case_id!r}")
+        root = self.root.resolve()
+        directory = (root / case_id).resolve()
+        if not directory.is_relative_to(root):
+            raise MaterialError("experiment path escapes current experiment root")
+        if question is None and not directory.is_dir():
+            raise MaterialError(f"experiment materials missing: {directory}")
+        if (directory / "manifest.json").exists():
+            self.verify_manifest(directory)
+        method = self.read_method(case_id, directory) if (directory / "method.md").exists() else ""
+        protocol = self.read_protocol(case_id, directory) if (directory / "protocol.json").exists() else {}
+        sample = self.read_sample(case_id, directory) if (directory / "sample.json").exists() else {}
+        if question is not None:
+            if not method:
+                method = question.input + "\n" + "\n".join(question.constraints)
+            if not protocol:
+                specs = metric_specs_from_text("\n".join([question.input, *question.constraints, question.expected_output]))
+                specs = list({(s['name'], s['unit']): s for s in specs}.values())
+                protocol = {"case_id": case_id}
+                if len(specs) == 3:
+                    protocol['metrics'] = specs
+        return ExperimentBundle(case_id, directory, method, protocol, sample)
 
     def read_method(self, case_id: str, case_dir: Path | None = None) -> str:
         directory = case_dir or self.case_dir(case_id)
@@ -114,9 +119,11 @@ class ExperimentMaterials:
         raw = self._read_json(path)
         if not isinstance(raw, dict):
             raise MaterialError(f"{path} must contain an object")
-        if raw.get("case_id") != case_id:
+        if "case_id" in raw and raw["case_id"] != case_id:
             raise MaterialError(f"{path}: case_id does not match {case_id}")
         metrics = raw.get("metrics")
+        if metrics is None:
+            return raw
         if not isinstance(metrics, list) or len(metrics) != 3:
             raise MaterialError(f"{path}: expected exactly three metrics")
         for item in metrics:
@@ -132,16 +139,14 @@ class ExperimentMaterials:
                 )
         return raw
 
-    def read_sample(self, case_id: str, case_dir: Path | None = None) -> dict[str, Any]:
+    def read_sample(self, case_id: str, case_dir: Path | None = None) -> Any:
         directory = case_dir or self.case_dir(case_id)
         path = directory / "sample.json"
         raw = self._read_json(path)
-        if not isinstance(raw, dict):
-            raise MaterialError(f"{path} must contain an object")
-        if raw.get("case_id") != case_id:
+        if not isinstance(raw, (dict, list)):
+            raise MaterialError(f"{path}: public examples must be an object or list")
+        if isinstance(raw, dict) and "case_id" in raw and raw['case_id'] != case_id:
             raise MaterialError(f"{path}: case_id does not match {case_id}")
-        if "data" not in raw:
-            raise MaterialError(f"{path}: missing data")
         return raw
 
     def verify_manifest(self, case_dir: Path) -> None:

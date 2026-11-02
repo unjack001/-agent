@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import os
+import asyncio
 from typing import Any
 
+from src.time_limits import remaining_seconds, SAVE_RESERVE_S
 from src.config import RuntimeConfig
-from src.llm.parsing import LLMError, LLMOutputError, LLMTruncatedError, parse_json_object
+from src.llm.parsing import (
+    LLMError, LLMOutputError, LLMTransientError, LLMTruncatedError, parse_json_object,
+)
 
 
 class GatewayClient:
@@ -56,12 +60,33 @@ class GatewayClient:
             kwargs["extra_headers"] = {"X-Session-ID": session_id}
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
+        timeout = remaining_seconds(self.config.llm_timeout_s, reserve=SAVE_RESERVE_S)
+        kwargs["timeout"] = timeout
         try:
-            response = await client.chat.completions.create(**kwargs)
+            if timeout <= 0:
+                raise asyncio.TimeoutError("case budget exhausted")
+            response = await asyncio.wait_for(client.chat.completions.create(**kwargs), timeout)
+        except asyncio.TimeoutError:
+            raise
         except LLMError:
             raise
         except Exception as exc:
-            raise LLMError("gateway call failed") from exc
+            status = getattr(exc, "status_code", None)
+            if not isinstance(status, int) or isinstance(status, bool) or not 100 <= status <= 599:
+                status = None
+            retryable = isinstance(exc, (TimeoutError, ConnectionError))
+            try:
+                from openai import APIConnectionError, APITimeoutError
+            except ImportError:
+                pass
+            else:
+                retryable = retryable or isinstance(exc, (APIConnectionError, APITimeoutError))
+            retryable = retryable or status in (408, 409, 429) or (status is not None and status >= 500)
+            # Preserve safe diagnostics, without logging upstream bodies,
+            # authorization headers or SDK exception text.
+            if retryable:
+                raise LLMTransientError("gateway temporarily unavailable", status_code=status) from None
+            raise LLMError("gateway call failed", status_code=status) from None
 
         choices = getattr(response, "choices", None) or []
         if not choices:

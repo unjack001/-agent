@@ -10,6 +10,19 @@ from typing import Any
 class LLMError(RuntimeError):
     """Raised when a gateway response cannot be used."""
 
+    def __init__(self, message: str, *, status_code: int | None = None,
+                 retryable: bool = False) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.retryable = retryable
+
+
+class LLMTransientError(LLMError):
+    """A temporary upstream failure; the caller owns the bounded retry."""
+
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message, status_code=status_code, retryable=True)
+
 
 class LLMTruncatedError(LLMError):
     """A token-limited reply was discarded and may be regenerated safely."""
